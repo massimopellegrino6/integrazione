@@ -107,8 +107,8 @@ async function updateShopifyFulfillmentTracking(fulfillmentId, tracking) {
       notify_customer: false,
       tracking_info: {
         number: tracking.number,
-        company: tracking.company,
-        url: tracking.url,
+        ...(tracking.company ? { company: tracking.company } : {}),
+        ...(tracking.url ? { url: tracking.url } : {}),
       },
     },
   };
@@ -140,7 +140,7 @@ function needsTrackingUpdate(fulfillment, elogyOrder) {
     url: elogyOrder.trackingUrl || null,
   };
 
-  if (!desired.url) return false;
+  if (!desired.number) return false;
   return (
     current.number !== desired.number ||
     current.company !== desired.company ||
@@ -208,7 +208,7 @@ async function getRecentElogyShippings() {
         externalOrderId: row.external_id || null,
       };
     })
-    .filter((row) => row.orderNumber && row.trackingUrl);
+    .filter((row) => row.orderNumber && row.shippingNumber);
 
   return {
     raw: data,
@@ -234,7 +234,7 @@ async function syncRecentTrackings() {
       carrier,
     });
 
-    if (!shipment.orderNumber || !trackingUrl) {
+    if (!shipment.orderNumber || !shippingNumber) {
       results.push({
         orderNumber: shipment.orderNumber,
         skipped: true,
@@ -318,6 +318,6 @@ app.post('/sync', async (_req, res) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Elogy-Shopify sync listening on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Elogy-Shopify sync listening on http://0.0.0.0:${PORT}`);
 });
