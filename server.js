@@ -149,38 +149,52 @@ function needsTrackingUpdate(fulfillment, elogyOrder) {
 }
 
 // ---------------- ELOGY ----------------
-// NOTE:
-// This function uses the data shape that we verified manually in your tests.
-// If Elogy returns a slightly different payload in production, adapt the mapping below.
+// Primary source: manageOrders
+// This endpoint exposes progressive shipping data earlier than /shipped,
+// including ext_shipping_number when available, even before tracking_link is present.
 async function getRecentElogyShippings() {
-  const url = `${ELOGY_BASE_URL}/shipped`;
-  const { data } = await axios.get(url, {
-    headers: elogyHeaders(),
-    params: {
-      offset: 0,
-      length: 100,
-      from_date: isoDateDaysAgo(ELOGY_LOOKBACK_DAYS),
-      to_date: '',
-      from_created_at: '',
-      to_created_at: '',
-      gateway: '',
-      text: '',
-    },
-    timeout: 30000,
-  });
+  const pageSize = 100;
+  let offset = 0;
+  let total = null;
+  const allRows = [];
 
-  console.log('ELOGY SHIPPED RAW RESPONSE:');
-  console.dir(data, { depth: null });
+  while (total === null || offset < total) {
+    const url = `${ELOGY_BASE_URL}/manageOrders`;
+    const { data } = await axios.get(url, {
+      headers: elogyHeaders(),
+      params: {
+        sort: 'created_at',
+        sort_dir: 'desc',
+        offset,
+        length: pageSize,
+      },
+      timeout: 30000,
+    });
 
-  const rows = data?.data || data?.rows || data?.results || [];
-  console.log('ELOGY SHIPPED ROWS COUNT:', rows.length);
+    console.log(`ELOGY MANAGE ORDERS RAW RESPONSE OFFSET ${offset}:`);
+    console.dir(data, { depth: null });
 
-  const normalized = rows
+    const rows = data?.data || data?.rows || data?.results || [];
+    total = Number(data?.total || rows.length || 0);
+
+    allRows.push(...rows);
+
+    if (!rows.length) break;
+    offset += pageSize;
+
+    // Safety break in case the API returns an invalid total.
+    if (offset > 5000) break;
+  }
+
+  console.log('ELOGY MANAGE ORDERS ROWS COUNT:', allRows.length);
+
+  const normalized = allRows
     .map((row) => {
       const orderNumber = normalizeOrderName(
         row.order_number || row.order_name || row.order?.order_number || row.number || row.orderNumber
       );
 
+      const trackingUrl = row.tracking_link || row.trackingUrl || null;
       const shippingNumber =
         row.ext_shipping_number ||
         row.shipment_id ||
@@ -188,14 +202,19 @@ async function getRecentElogyShippings() {
         row.shipping_number ||
         row.shippingNumber ||
         row.tracking_number ||
-        extractShippingNumberFromUrl(row.tracking_link || row.trackingUrl) ||
+        extractShippingNumberFromUrl(trackingUrl) ||
         null;
 
-      const trackingUrl = row.tracking_link || row.trackingUrl || null;
       const carrier = normalizeCarrierName(
         row.carrier?.name || row.carrier_name || row.carrier_slug || row.carrier || null
       );
-      const trackingStatus = row.tracking_status || row.status || row.last_status || null;
+
+      const trackingStatus =
+        row.tracking_status_name ||
+        row.tracking_status ||
+        row.status ||
+        row.last_status ||
+        null;
 
       return {
         raw: row,
@@ -204,6 +223,7 @@ async function getRecentElogyShippings() {
         trackingUrl,
         carrier,
         trackingStatus,
+        status: row.status || row.last_status || null,
         externalFulfillmentId: row.external_fulfillment_id || null,
         externalOrderId: row.external_id || null,
       };
@@ -211,15 +231,15 @@ async function getRecentElogyShippings() {
     .filter((row) => row.orderNumber && row.shippingNumber);
 
   return {
-    raw: data,
-    rowsCount: rows.length,
+    raw: { total, rowsCount: allRows.length },
+    rowsCount: allRows.length,
     normalized,
   };
 }
 
 async function syncRecentTrackings() {
   const elogy = await getRecentElogyShippings();
-  const shippings = elogy.normalized || [];
+  const shippings = (elogy.normalized || []).slice(0, 500);
   const results = [];
 
   for (const shipment of shippings) {
@@ -293,6 +313,8 @@ async function syncRecentTrackings() {
       trackingNumber: shippingNumber,
       trackingUrl,
       carrier,
+      status: shipment.status || null,
+      trackingStatus: shipment.trackingStatus || null,
       response: update,
     });
   }
