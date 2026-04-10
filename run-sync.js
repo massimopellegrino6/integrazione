@@ -207,7 +207,7 @@ async function getRecentElogyShippings() {
     })
     .filter((row) => row.orderNumber && row.shippingNumber);
 
-  return normalized.slice(0, 500);
+  return normalized.slice(0, 50);
 }
 
 async function syncRecentTrackings() {
