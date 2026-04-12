@@ -2,7 +2,9 @@ import 'dotenv/config';
 import axios from 'axios';
 
 const SHOPIFY_STORE = process.env.SHOPIFY_STORE;
-const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN;
+const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN || null;
+const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || null;
+const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || null;
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-04';
 
 const ELOGY_BASE_URL = process.env.ELOGY_BASE_URL || 'https://api.elogy.io/api';
@@ -10,17 +12,49 @@ const ELOGY_TOKEN = process.env.ELOGY_TOKEN;
 const ELOGY_AUTH_MODE = process.env.ELOGY_AUTH_MODE || 'raw';
 const DRY_RUN = String(process.env.DRY_RUN || 'false').toLowerCase() === 'true';
 
-if (!SHOPIFY_STORE || !SHOPIFY_TOKEN) {
-  throw new Error('Missing SHOPIFY_STORE or SHOPIFY_TOKEN');
+if (!SHOPIFY_STORE) {
+  throw new Error('Missing SHOPIFY_STORE');
 }
 
-if (!ELOGY_TOKEN) {
-  throw new Error('Missing ELOGY_TOKEN');
+if (!SHOPIFY_TOKEN && !(SHOPIFY_CLIENT_ID && SHOPIFY_CLIENT_SECRET)) {
+  throw new Error('Missing Shopify credentials: provide SHOPIFY_TOKEN or SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET');
 }
 
-function shopifyHeaders() {
+let cachedShopifyAccessToken = SHOPIFY_TOKEN;
+
+async function getShopifyAccessToken() {
+  if (cachedShopifyAccessToken) {
+    return cachedShopifyAccessToken;
+  }
+
+  const url = `https://${SHOPIFY_STORE}/admin/oauth/access_token`;
+  const payload = {
+    grant_type: 'client_credentials',
+    client_id: SHOPIFY_CLIENT_ID,
+    client_secret: SHOPIFY_CLIENT_SECRET,
+  };
+
+  const { data } = await axios.post(url, payload, {
+    headers: {
+      'Content-Type': 'application/json',
+      Accept: 'application/json',
+    },
+    timeout: 30000,
+  });
+
+  if (!data?.access_token) {
+    throw new Error('Failed to obtain Shopify access token');
+  }
+
+  cachedShopifyAccessToken = data.access_token;
+  return cachedShopifyAccessToken;
+}
+
+async function shopifyHeaders() {
+  const accessToken = await getShopifyAccessToken();
+
   return {
-    'X-Shopify-Access-Token': SHOPIFY_TOKEN,
+    'X-Shopify-Access-Token': accessToken,
     'Content-Type': 'application/json',
     Accept: 'application/json',
   };
@@ -92,8 +126,9 @@ function needsTrackingUpdate(fulfillment, elogyOrder) {
 
 async function getRecentShopifyOrders(limit = 250) {
   const url = `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/orders.json`;
+  const headers = await shopifyHeaders();
   const { data } = await axios.get(url, {
-    headers: shopifyHeaders(),
+    headers,
     params: {
       status: 'any',
       limit,
@@ -128,8 +163,9 @@ async function updateShopifyFulfillmentTracking(fulfillmentId, tracking) {
     return { dryRun: true, fulfillmentId, payload };
   }
 
+  const headers = await shopifyHeaders();
   const { data } = await axios.post(url, payload, {
-    headers: shopifyHeaders(),
+    headers,
     timeout: 30000,
   });
 
@@ -286,6 +322,11 @@ async function syncRecentTrackings() {
 (async () => {
   try {
     console.log('Starting one-off sync job...');
+    if (SHOPIFY_TOKEN) {
+      console.log('Using static Shopify token from environment');
+    } else {
+      console.log('Using dynamic Shopify token via client credentials');
+    }
     const results = await syncRecentTrackings();
 
     const summary = {
