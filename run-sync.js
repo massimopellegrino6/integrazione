@@ -6,21 +6,36 @@ const SHOPIFY_TOKEN = process.env.SHOPIFY_TOKEN || null;
 const SHOPIFY_CLIENT_ID = process.env.SHOPIFY_CLIENT_ID || null;
 const SHOPIFY_CLIENT_SECRET = process.env.SHOPIFY_CLIENT_SECRET || null;
 const SHOPIFY_API_VERSION = process.env.SHOPIFY_API_VERSION || '2026-04';
+const SHOPIFY_LOCATION_ID = process.env.SHOPIFY_LOCATION_ID || null;
 
 const ELOGY_BASE_URL = process.env.ELOGY_BASE_URL || 'https://api.elogy.io/api';
 const ELOGY_TOKEN = process.env.ELOGY_TOKEN;
 const ELOGY_AUTH_MODE = process.env.ELOGY_AUTH_MODE || 'raw';
 const DRY_RUN = String(process.env.DRY_RUN || 'false').toLowerCase() === 'true';
+const MAX_ORDERS_PER_RUN = Number(process.env.MAX_ORDERS_PER_RUN || 50);
+const MAX_STOCK_PRODUCTS_PER_RUN = Number(process.env.MAX_STOCK_PRODUCTS_PER_RUN || 200);
+const ELOGY_WAREHOUSE_ID = process.env.ELOGY_WAREHOUSE_ID || null;
 
 if (!SHOPIFY_STORE) {
   throw new Error('Missing SHOPIFY_STORE');
 }
 
 if (!SHOPIFY_TOKEN && !(SHOPIFY_CLIENT_ID && SHOPIFY_CLIENT_SECRET)) {
-  throw new Error('Missing Shopify credentials: provide SHOPIFY_TOKEN or SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET');
+  throw new Error(
+    'Missing Shopify credentials: provide SHOPIFY_TOKEN or SHOPIFY_CLIENT_ID and SHOPIFY_CLIENT_SECRET'
+  );
+}
+
+if (!SHOPIFY_LOCATION_ID) {
+  throw new Error('Missing SHOPIFY_LOCATION_ID');
+}
+
+if (!ELOGY_TOKEN) {
+  throw new Error('Missing ELOGY_TOKEN');
 }
 
 let cachedShopifyAccessToken = SHOPIFY_TOKEN;
+let cachedInventoryMap = null;
 
 async function getShopifyAccessToken() {
   if (cachedShopifyAccessToken) {
@@ -243,7 +258,7 @@ async function getRecentElogyShippings() {
     })
     .filter((row) => row.orderNumber && row.shippingNumber);
 
-  return normalized.slice(0, 50);
+  return normalized.slice(0, MAX_ORDERS_PER_RUN);
 }
 
 async function syncRecentTrackings() {
@@ -319,6 +334,164 @@ async function syncRecentTrackings() {
   return results;
 }
 
+async function getShopifyLocationId() {
+  return Number(SHOPIFY_LOCATION_ID);
+}
+
+async function getShopifyInventoryMap() {
+  if (cachedInventoryMap) {
+    return cachedInventoryMap;
+  }
+
+  const headers = await shopifyHeaders();
+  const map = new Map();
+  let pageInfo = null;
+
+  while (true) {
+    const url = `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/variants.json`;
+    const params = {
+      limit: 250,
+      fields: 'id,sku,inventory_item_id',
+      ...(pageInfo ? { page_info: pageInfo } : {}),
+    };
+
+    const response = await axios.get(url, {
+      headers,
+      params,
+      timeout: 30000,
+    });
+
+    const variants = response.data?.variants || [];
+    for (const variant of variants) {
+      const sku = String(variant.sku || '').trim();
+      const inventoryItemId = variant.inventory_item_id || null;
+      if (sku && inventoryItemId) {
+        map.set(sku, {
+          inventoryItemId,
+          variantId: variant.id,
+        });
+      }
+    }
+
+    const linkHeader = response.headers?.link || response.headers?.Link || '';
+    const nextMatch = linkHeader.match(/<[^>]+[?&]page_info=([^&>]+)[^>]*>;\s*rel="next"/);
+    if (!nextMatch) {
+      break;
+    }
+
+    pageInfo = decodeURIComponent(nextMatch[1]);
+  }
+
+  cachedInventoryMap = map;
+  return cachedInventoryMap;
+}
+
+async function setShopifyInventoryLevel(inventoryItemId, available) {
+  const url = `https://${SHOPIFY_STORE}/admin/api/${SHOPIFY_API_VERSION}/inventory_levels/set.json`;
+  const headers = await shopifyHeaders();
+  const payload = {
+    location_id: await getShopifyLocationId(),
+    inventory_item_id: inventoryItemId,
+    available,
+  };
+
+  if (DRY_RUN) {
+    return { dryRun: true, payload };
+  }
+
+  const { data } = await axios.post(url, payload, {
+    headers,
+    timeout: 30000,
+  });
+
+  return data;
+}
+
+async function getRecentElogyStocks() {
+  const pageSize = 100;
+  let offset = 0;
+  let total = null;
+  const allRows = [];
+
+  while (total === null || offset < total) {
+    const url = `${ELOGY_BASE_URL}/productsStocks`;
+    const { data } = await axios.get(url, {
+      headers: elogyHeaders(),
+      params: {
+        offset,
+        length: pageSize,
+        load_net_stock: 1,
+        ...(ELOGY_WAREHOUSE_ID ? { warehouse_id: ELOGY_WAREHOUSE_ID } : {}),
+      },
+      timeout: 30000,
+    });
+
+    const rows = data?.data || [];
+    total = Number(data?.total || rows.length || 0);
+    allRows.push(...rows);
+
+    if (!rows.length) break;
+    offset += pageSize;
+    if (offset > 5000) break;
+  }
+
+  return allRows
+    .map((row) => ({
+      sku: String(row.sku || '').trim(),
+      productName: row.name || null,
+      quantityStock: Number(row.quantity_stock ?? 0),
+      netStock: Number(row.net_stock ?? 0),
+      externalId: row.external_id || null,
+      raw: row,
+    }))
+    .filter((row) => row.sku)
+    .slice(0, MAX_STOCK_PRODUCTS_PER_RUN);
+}
+
+async function syncRecentStocks() {
+  const elogyStocks = await getRecentElogyStocks();
+  const inventoryMap = await getShopifyInventoryMap();
+  const results = [];
+
+  for (const stock of elogyStocks) {
+    const match = inventoryMap.get(stock.sku);
+    if (!match) {
+      results.push({
+        sku: stock.sku,
+        skipped: true,
+        reason: 'shopify_sku_not_found',
+      });
+      continue;
+    }
+
+    const desiredAvailable = Math.max(0, stock.netStock);
+
+    try {
+      const response = await setShopifyInventoryLevel(match.inventoryItemId, desiredAvailable);
+      results.push({
+        sku: stock.sku,
+        productName: stock.productName,
+        inventoryItemId: match.inventoryItemId,
+        variantId: match.variantId,
+        available: desiredAvailable,
+        updated: true,
+        response,
+      });
+    } catch (error) {
+      results.push({
+        sku: stock.sku,
+        productName: stock.productName,
+        inventoryItemId: match.inventoryItemId,
+        failed: true,
+        reason: 'shopify_inventory_update_failed',
+        error: error?.response?.data || error?.message || 'Unknown error',
+      });
+    }
+  }
+
+  return results;
+}
+
 (async () => {
   try {
     console.log('Starting one-off sync job...');
@@ -327,17 +500,27 @@ async function syncRecentTrackings() {
     } else {
       console.log('Using dynamic Shopify token via client credentials');
     }
-    const results = await syncRecentTrackings();
+
+    const trackingResults = await syncRecentTrackings();
+    const stockResults = await syncRecentStocks();
 
     const summary = {
       ok: true,
-      count: results.length,
-      updated: results.filter((r) => r.updated).length,
-      skipped: results.filter((r) => r.skipped).length,
+      tracking: {
+        count: trackingResults.length,
+        updated: trackingResults.filter((r) => r.updated).length,
+        skipped: trackingResults.filter((r) => r.skipped).length,
+      },
+      stock: {
+        count: stockResults.length,
+        updated: stockResults.filter((r) => r.updated).length,
+        skipped: stockResults.filter((r) => r.skipped).length,
+        failed: stockResults.filter((r) => r.failed).length,
+      },
     };
 
     console.log(JSON.stringify(summary, null, 2));
-    console.log(JSON.stringify(results, null, 2));
+    console.log(JSON.stringify({ trackingResults, stockResults }, null, 2));
 
     process.exit(0);
   } catch (error) {
