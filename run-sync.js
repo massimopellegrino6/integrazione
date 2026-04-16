@@ -464,8 +464,8 @@ async function syncRecentStocks() {
       continue;
     }
 
-    const desiredAvailable = Math.max(0, stock.netStock);
-
+  const desiredAvailable = Math.max(0, stock.quantityStock);
+  
     try {
       const response = await setShopifyInventoryLevel(match.inventoryItemId, desiredAvailable);
       results.push({
@@ -520,8 +520,16 @@ async function syncRecentStocks() {
     };
 
     console.log(JSON.stringify(summary, null, 2));
-    console.log(JSON.stringify({ trackingResults, stockResults }, null, 2));
-
+console.log(
+  JSON.stringify(
+    {
+      trackingResults: trackingResults.slice(0, 10),
+      stockResults: stockResults.slice(0, 20),
+    },
+    null,
+    2
+  )
+);
     process.exit(0);
   } catch (error) {
     console.error('Sync job failed');
